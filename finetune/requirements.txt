@@ -32,7 +32,7 @@ socksio==1.0.0
 gradio
 gradio_client
 http://thunlp.oss-cn-qingdao.aliyuncs.com/multi_modal/never_delete/modelscope_studio-0.4.0.9-py3-none-any.whl
-decord
+# decord: no wheels for macOS ARM64; added in pyproject.toml with platform marker
 aiosignal
 tensorboard
 deepspeed==0.12.3
@@ -43,5 +43,5 @@ vector-quantize-pytorch==1.18.5
 vocos==0.1.0
 peft==0.14.0
 ninja==1.11.1.1
-flash-attn
+# flash-attn: requires CUDA to build; install with: uv add flash-attn (only on Linux with GPU)
 moviepy
