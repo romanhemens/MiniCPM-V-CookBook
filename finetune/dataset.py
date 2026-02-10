@@ -1,4 +1,5 @@
 import copy
+import io
 import json
 import logging
 import math
@@ -51,11 +52,18 @@ class SupervisedDataset(Dataset):
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         try:
-            if isinstance(self.raw_data[i]["image"], str):
-                images_dict = { "<image>" : Image.open(self.raw_data[i]["image"]).convert("RGB") }
-            elif isinstance(self.raw_data[i]["image"], Dict):
+            img_spec = self.raw_data[i]["image"]
+            if isinstance(img_spec, str):
+                images_dict = { "<image>" : Image.open(img_spec).convert("RGB") }
+            elif isinstance(img_spec, Dict) and "bytes" in img_spec:
+                # SNEI-style parquet: image stored as {"bytes": b"..."}
+                image_bytes = img_spec["bytes"]
+                if hasattr(image_bytes, "tobytes"):
+                    image_bytes = image_bytes.tobytes()
+                images_dict = { "<image>": Image.open(io.BytesIO(image_bytes)).convert("RGB") }
+            elif isinstance(img_spec, Dict):
                 ### for multi-images input, the template for every image is <image_xx>, such as <image_00>, <image_01>
-                images_dict = {img_name : Image.open(img_path).convert("RGB") for img_name, img_path in self.raw_data[i]["image"].items()}
+                images_dict = {img_name : Image.open(img_path).convert("RGB") for img_name, img_path in img_spec.items()}
                 
             ret = preprocess(
                 images_dict,
