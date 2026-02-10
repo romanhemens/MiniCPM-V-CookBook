@@ -2,14 +2,27 @@ import glob
 import json
 import logging
 import os
+import sys
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Dict, List, Optional, Union, Literal, Tuple
+from typing import Dict, List, Optional, Union, Literal, Tuple, Any
 from types import MethodType
 from torchvision import transforms
 
+# When flash_attn is not available (e.g. Mac without CUDA): force transformers to report it as
+# unavailable so model code uses eager/sdpa attention. We pass attn_implementation="eager"/"sdpa" when loading.
+try:
+    import flash_attn  # noqa: F401
+    _have_flash_attn = True
+except ImportError:
+    _have_flash_attn = False
+
 import torch
 import transformers
+
+if not _have_flash_attn:
+    import transformers.utils.import_utils as _tf_import_utils
+    _tf_import_utils.is_flash_attn_2_available = lambda: False
 from accelerate.utils import DistributedType
 from deepspeed import zero
 from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
@@ -31,10 +44,25 @@ class ModelArguments:
 @dataclass
 class DataArguments:
     data_path: str = field(
-        default=None, metadata={"help": "Path to the training data."}
+        default=None, metadata={"help": "Path to the training data (JSON or Parquet)."}
     )
     eval_data_path: str = field(
-        default=None, metadata={"help": "Path to the evaluation data."}
+        default=None, metadata={"help": "Path to the evaluation data (JSON or Parquet)."}
+    )
+    # Parquet: column name for image path(s); use "image" or "image_path"
+    parquet_image_column: str = field(
+        default="image",
+        metadata={"help": "Parquet column name for image path (or image_path)."},
+    )
+    # Parquet: column name for conversations; use "conversations" or "messages"
+    parquet_conversations_column: str = field(
+        default="conversations",
+        metadata={"help": "Parquet column name for conversations (list or JSON string)."},
+    )
+    # SNEI format: parquet with "image" (dict with "bytes") and "ground_truth" (JSON); builds user/assistant from your prompt template
+    snei_format: bool = field(
+        default=False,
+        metadata={"help": "Use SNEI parquet format: image.bytes + ground_truth with social-navigation prompt."},
     )
 
 
@@ -81,6 +109,149 @@ def safe_save_model_for_hf_trainer(trainer, output_dir: str, bias="none"):
         trainer.save_model(output_dir,)
 
 
+def load_dataset_data(
+    path: str,
+    parquet_image_column: str = "image",
+    parquet_conversations_column: str = "conversations",
+) -> List[Dict[str, Any]]:
+    """
+    Load training/eval data from a JSON file or a Parquet file.
+    Returns a list of dicts, each with keys "image" and "conversations"
+    as expected by SupervisedDataset.
+
+    - JSON: file must be a list of {"image": path_or_dict, "conversations": [...]}.
+    - Parquet: each row is one sample. Column names are configurable.
+      "conversations" can be a list of dicts or a JSON string.
+    """
+    path = path.strip()
+    if path.lower().endswith(".parquet"):
+        try:
+            import pandas as pd
+        except ImportError:
+            raise ImportError("Parquet support requires pandas: pip install pandas pyarrow")
+        df = pd.read_parquet(path)
+        img_col = parquet_image_column
+        conv_col = parquet_conversations_column
+        if img_col not in df.columns and img_col == "image":
+            img_col = "image_path"
+        if conv_col not in df.columns and conv_col == "conversations":
+            conv_col = "messages"
+        if img_col not in df.columns or conv_col not in df.columns:
+            raise ValueError(
+                f"Parquet must have columns for image and conversations. "
+                f"Available: {list(df.columns)}. "
+                f"Use --parquet_image_column and --parquet_conversations_column if your names differ."
+            )
+        rows = []
+        for _, row in df.iterrows():
+            image = row[img_col]
+            conv = row[conv_col]
+            if isinstance(conv, str):
+                conv = json.loads(conv)
+            # Normalize image: may be str, dict (multi-image), or pandas/numpy scalar
+            if isinstance(image, str) and image.strip().startswith("{"):
+                image = json.loads(image)
+            elif not isinstance(image, (str, dict)) and hasattr(image, "item"):
+                image = image.item()
+            elif not isinstance(image, (str, dict)):
+                image = str(image)
+            rows.append({"image": image, "conversations": conv})
+        return rows
+    else:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            raise ValueError("JSON data must be a list of samples (each with 'image' and 'conversations').")
+        return data
+
+
+# SNEI (social navigation) user prompt – same as in your SNEIDataset
+SNEI_USER_PROMPT = (
+    "<image>\n"
+    "Assume a nominal forward-moving robot unless otherwise specified.\n"
+    "Analyze the social situation in the image.\n"
+    "Identify navigation-relevant social constraints.\n"
+    "Do not propose actions, trajectories, or motion commands.\n\n"
+    "Use the following output format strictly:\n\n"
+    "[REASONING]\n"
+    "<optional internal reasoning>\n\n"
+    "[PERCEPTION]\n"
+    "<Describe the social situation in the image.>\n\n"
+    "[PREDICTION]\n"
+    "<Describe the prediction about the social situation in the image.>\n\n"
+    "[INTERACTION_TYPE]\n"
+    "<passing | overtaking | crossing | waiting | none>\n\n"
+    "[CONSTRAINTS]\n"
+    "- lateral_preference: <hard_left | left | slight_left | straight | slight_right | right | hard_right>\n"
+    "- speed_constraint: <stop | very_slow | slow | maintain | cruise | speed_up | fast_sprint>\n"
+)
+
+
+def _normalize_text(val):
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    if isinstance(val, list) and val:
+        return val[0].strip() if isinstance(val[0], str) else str(val[0])
+    return "Unknown"
+
+
+def load_snei_parquet(path: str) -> List[Dict[str, Any]]:
+    """
+    Load SNEI-format parquet: columns "image" (dict with "bytes") and "ground_truth" (JSON).
+    Builds conversations from your social-navigation prompt and ground_truth fields.
+    """
+    import pandas as pd
+    df = pd.read_parquet(path)
+    if "image" not in df.columns or "ground_truth" not in df.columns:
+        raise ValueError(
+            f"SNEI parquet must have columns 'image' and 'ground_truth'. Found: {list(df.columns)}"
+        )
+    rows = []
+    for _, row in df.iterrows():
+        try:
+            gt = (
+                json.loads(row["ground_truth"])
+                if isinstance(row["ground_truth"], str)
+                else row["ground_truth"]
+            )
+        except Exception:
+            gt = {}
+        it_raw = gt.get("Interaction_Type", "Unknown")
+        interaction_type = (
+            it_raw[0] if isinstance(it_raw, list) and it_raw else (it_raw if isinstance(it_raw, str) else str(it_raw or "Unknown"))
+        )
+        desc = gt.get("Description") or {}
+        perception = _normalize_text(desc.get("Perception", "Unknown"))
+        prediction = _normalize_text(desc.get("Prediction", "Unknown"))
+        reasoning = _normalize_text(desc.get("Chain of Thought Reasoning", "Unknown"))
+        lateral_pref = _normalize_text(desc.get("lateral_preference", "Unknown"))
+        speed_constraint = _normalize_text(desc.get("speed_constraint", "Unknown"))
+        interaction = interaction_type.lower() if isinstance(interaction_type, str) else str(interaction_type).lower()
+
+        assistant_answer = (
+            "[REASONING]\n"
+            f"{reasoning}\n\n"
+            "[PERCEPTION]\n"
+            f"{perception}\n\n"
+            "[PREDICTION]\n"
+            f"{prediction}\n\n"
+            "[INTERACTION_TYPE]\n"
+            f"{interaction}\n\n"
+            "[CONSTRAINTS]\n"
+            f"- lateral_preference: {lateral_pref}\n"
+            f"- speed_constraint: {speed_constraint}"
+        )
+        image_val = row["image"]
+        if isinstance(image_val, dict) and "bytes" not in image_val:
+            raise ValueError("SNEI 'image' column must be dict with 'bytes' key")
+        conversations = [
+            {"role": "user", "content": SNEI_USER_PROMPT},
+            {"role": "assistant", "content": assistant_answer},
+        ]
+        rows.append({"image": image_val, "conversations": conversations})
+    return rows
+
+
 def make_supervised_data_module(
     tokenizer: transformers.PreTrainedTokenizer,
     data_args,
@@ -98,9 +269,20 @@ def make_supervised_data_module(
 
     rank0_print("Loading data...")
 
-    train_json = json.load(open(data_args.data_path, "r"))
+    use_snei = getattr(data_args, "snei_format", False)
+    is_parquet = (data_args.data_path or "").strip().lower().endswith(".parquet")
+
+    if use_snei and is_parquet:
+        rank0_print("Using SNEI parquet format (image.bytes + ground_truth).")
+        train_data = load_snei_parquet(data_args.data_path)
+    else:
+        train_data = load_dataset_data(
+            data_args.data_path,
+            parquet_image_column=getattr(data_args, "parquet_image_column", "image"),
+            parquet_conversations_column=getattr(data_args, "parquet_conversations_column", "conversations"),
+        )
     train_dataset = dataset_cls(
-        train_json,
+        train_data,
         transform,
         tokenizer,
         slice_config=slice_config,
@@ -112,9 +294,17 @@ def make_supervised_data_module(
     )
 
     if data_args.eval_data_path:
-        eval_json = json.load(open(data_args.eval_data_path, "r"))
+        eval_is_parquet = (data_args.eval_data_path or "").strip().lower().endswith(".parquet")
+        if use_snei and eval_is_parquet:
+            eval_data = load_snei_parquet(data_args.eval_data_path)
+        else:
+            eval_data = load_dataset_data(
+                data_args.eval_data_path,
+                parquet_image_column=getattr(data_args, "parquet_image_column", "image"),
+                parquet_conversations_column=getattr(data_args, "parquet_conversations_column", "conversations"),
+            )
         eval_dataset = dataset_cls(
-            eval_json,
+            eval_data,
             transform,
             tokenizer,
             slice_config=slice_config,
@@ -197,6 +387,13 @@ def train():
                 "FSDP or ZeRO3 are not incompatible with QLoRA."
             )
     
+    # Hugging Face token for gated repos (e.g. MiniCPM): set HF_TOKEN or HUGGING_FACE_HUB_TOKEN, or run `huggingface-cli login`
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or True
+
+    # Use eager (or sdpa) attention when flash_attn is not available (e.g. Mac)
+    attn_impl = "eager"
+    if torch.backends.mps.is_available():
+        attn_impl = "sdpa"  # SDPA can use MPS on Apple Silicon
     model = AutoModel.from_pretrained(
         model_args.model_name_or_path,
         trust_remote_code=True,
@@ -205,10 +402,12 @@ def train():
         init_vision=True,
         init_audio=False,
         init_tts=False,
+        attn_implementation=attn_impl,
+        token=hf_token,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path, trust_remote_code=True
+        model_args.model_name_or_path, trust_remote_code=True, token=hf_token
     )
 
     if not training_args.tune_vision:
