@@ -8,10 +8,13 @@ MASTER_PORT=6001
  
 MODEL="openbmb/MiniCPM-o-2_6"
 # or openbmb/MiniCPM-V-2, openbmb/MiniCPM-Llama3-V-2_5, openbmb/MiniCPM-V-2_6
-# ATTENTION: specify the path to your training data, which should be a json file consisting of a list of conversations.
-# See the section for finetuning in README for more information.
-DATA="path/to/trainging_data"
-EVAL_DATA="path/to/test_data"
+# ATTENTION: paths to your training and (optional) eval data.
+# Supported: .json (list of {image, conversations}) or .parquet.
+# For SNEI parquet (image.bytes + ground_truth with social-navigation prompt): set SNEI_FORMAT=true and DATA/EVAL_DATA to .parquet paths.
+# Otherwise: .parquet with columns "image" and "conversations", or .json. See dataset_guidance.md.
+DATA="path/to/training_data.json"
+EVAL_DATA="path/to/eval_data.json"
+SNEI_FORMAT=false   # set true for SNEI parquet (image bytes + ground_truth)
 # if use openbmb/MiniCPM-V-2, please set LLM_TYPE=minicpm, if use openbmb/MiniCPM-Llama3-V-2_5, please set LLM_TYPE="llama3",
 # if use openbmb/MiniCPM-o-2_6 or openbmb/MiniCPM-V-2_6, please set LLM_TYPE=qwen
 LLM_TYPE="qwen"   
@@ -25,11 +28,15 @@ DISTRIBUTED_ARGS="
     --master_port $MASTER_PORT
 "
 
+SNEI_ARGS=""
+if [ "$SNEI_FORMAT" = "true" ]; then SNEI_ARGS="--snei_format true"; fi
+
 torchrun $DISTRIBUTED_ARGS finetune.py  \
     --model_name_or_path $MODEL \
     --llm_type $LLM_TYPE \
     --data_path $DATA \
     --eval_data_path $EVAL_DATA \
+    $SNEI_ARGS \
     --remove_unused_columns false \
     --label_names "labels" \
     --prediction_loss_only false \
