@@ -46,24 +46,90 @@ class SupervisedDataset(Dataset):
         self.query_nums=query_nums
         self.batch_vision = batch_vision
         self.max_length = max_length
+        self._max_retries = 10  # Maximale Anzahl von Retry-Versuchen
 
     def __len__(self):
         return len(self.raw_data)
 
-    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, i, retry_count=0) -> Dict[str, torch.Tensor]:
+        """
+        Get item from dataset with improved error handling.
+        
+        Args:
+            i: Index of the item
+            retry_count: Internal counter to prevent infinite recursion
+        """
         try:
             img_spec = self.raw_data[i]["image"]
+            
+            # Handle different image formats
             if isinstance(img_spec, str):
-                images_dict = { "<image>" : Image.open(img_spec).convert("RGB") }
+                # Image path
+                images_dict = { "<image>": Image.open(img_spec).convert("RGB") }
             elif isinstance(img_spec, Dict) and "bytes" in img_spec:
                 # SNEI-style parquet: image stored as {"bytes": b"..."}
                 image_bytes = img_spec["bytes"]
-                if hasattr(image_bytes, "tobytes"):
+                
+                # Convert various formats to bytes
+                if isinstance(image_bytes, bytes):
+                    pass  # Already bytes
+                elif hasattr(image_bytes, "tobytes"):
+                    # numpy array or similar
                     image_bytes = image_bytes.tobytes()
-                images_dict = { "<image>": Image.open(io.BytesIO(image_bytes)).convert("RGB") }
+                elif hasattr(image_bytes, "item"):
+                    # pandas/numpy scalar - might be bytes already
+                    image_bytes = image_bytes.item()
+                    if not isinstance(image_bytes, bytes):
+                        # If still not bytes, try to convert
+                        if isinstance(image_bytes, np.ndarray):
+                            image_bytes = image_bytes.tobytes()
+                        else:
+                            raise ValueError(f"Cannot convert image_bytes to bytes at index {i}, got {type(image_bytes)}")
+                elif isinstance(image_bytes, (list, tuple)):
+                    # List of bytes or integers
+                    image_bytes = bytes(image_bytes)
+                else:
+                    raise ValueError(f"Image bytes at index {i} has unsupported type: {type(image_bytes)}")
+                
+                # Validate bytes are not empty
+                if len(image_bytes) == 0:
+                    raise ValueError(f"Image bytes at index {i} is empty")
+                
+                # Basic validation: check if bytes look like an image (PNG, JPEG, etc.)
+                if len(image_bytes) < 10:
+                    raise ValueError(f"Image bytes at index {i} too short ({len(image_bytes)} bytes)")
+                
+                # Try to load image from bytes
+                try:
+                    img_io = io.BytesIO(image_bytes)
+                    # Verify the BytesIO object is valid
+                    img_io.seek(0)
+                    img = Image.open(img_io)
+                    # Verify image format
+                    img.verify()  # Verify it's a valid image file
+                    # Reopen after verify (verify() closes the file)
+                    img_io.seek(0)
+                    img = Image.open(img_io)
+                    # Force load to catch errors early and verify image is valid
+                    img.load()
+                    # Convert to RGB (handles grayscale, RGBA, etc.)
+                    if img.mode != "RGB":
+                        img = img.convert("RGB")
+                    images_dict = { "<image>": img }
+                except Exception as e:
+                    # Provide more helpful error message
+                    preview = image_bytes[:20] if len(image_bytes) >= 20 else image_bytes
+                    raise ValueError(
+                        f"Failed to decode image bytes at index {i} "
+                        f"(length: {len(image_bytes)}, preview: {preview[:10].hex() if len(preview) >= 10 else 'N/A'}): {str(e)}"
+                    )
             elif isinstance(img_spec, Dict):
-                ### for multi-images input, the template for every image is <image_xx>, such as <image_00>, <image_01>
-                images_dict = {img_name : Image.open(img_path).convert("RGB") for img_name, img_path in img_spec.items()}
+                # Multi-image input
+                images_dict = {}
+                for img_name, img_path in img_spec.items():
+                    images_dict[img_name] = Image.open(img_path).convert("RGB")
+            else:
+                raise ValueError(f"Unknown image format at index {i}: {type(img_spec)}")
                 
             ret = preprocess(
                 images_dict,
@@ -86,10 +152,22 @@ class SupervisedDataset(Dataset):
                 tgt_sizes=ret["tgt_sizes"],
                 image_bound=ret["image_bound"],
             )
-        except:
-            logger.error(f"data fetch error")
-            return self.__getitem__(random.randint(0, len(self)))
-        return ret
+            return ret
+        except Exception as e:
+            # Prevent infinite recursion
+            if retry_count >= self._max_retries:
+                logger.error(f"Failed to load data after {self._max_retries} retries. Last error at index {i}: {str(e)}")
+                # Return a fallback: use index 0 (should always work if dataset is valid)
+                if i != 0:
+                    logger.warning(f"Trying fallback index 0")
+                    return self.__getitem__(0, retry_count=self._max_retries)
+                else:
+                    raise RuntimeError(f"Failed to load any data. Original error: {str(e)}")
+            
+            # Try a random index, but increment retry counter
+            new_idx = random.randint(0, len(self) - 1)
+            logger.warning(f"Error loading data at index {i} (attempt {retry_count + 1}/{self._max_retries}): {str(e)}. Trying index {new_idx}")
+            return self.__getitem__(new_idx, retry_count=retry_count + 1)
 
         
 def data_collator(examples, padding_value=0, max_length=2048):
