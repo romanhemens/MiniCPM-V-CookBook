@@ -75,3 +75,5 @@ logs/
 .venv
 venv/
 .env
+# output folder
+finetune/output/*
