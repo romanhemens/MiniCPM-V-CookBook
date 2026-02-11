@@ -1,6 +1,7 @@
 #!/bin/bash
 
-GPUS_PER_NODE=8
+GPUS_PER_NODE=1  # Reduced for testing
+# Note: Running without torchrun for single GPU to reduce memory overhead
 NNODES=1
 NODE_RANK=0
 MASTER_ADDR=localhost
@@ -12,13 +13,13 @@ MODEL="openbmb/MiniCPM-o-2_6"
 # Supported: .json (list of {image, conversations}) or .parquet.
 # For SNEI parquet (image.bytes + ground_truth with social-navigation prompt): set SNEI_FORMAT=true and DATA/EVAL_DATA to .parquet paths.
 # Otherwise: .parquet with columns "image" and "conversations", or .json. See dataset_guidance.md.
-DATA="path/to/training_data.json"
-EVAL_DATA="path/to/eval_data.json"
-SNEI_FORMAT=false   # set true for SNEI parquet (image bytes + ground_truth)
+DATA="~/SNEI_structured_train_840.parquet"
+EVAL_DATA=""
+SNEI_FORMAT=true   # set true for SNEI parquet (image bytes + ground_truth)
 # if use openbmb/MiniCPM-V-2, please set LLM_TYPE=minicpm, if use openbmb/MiniCPM-Llama3-V-2_5, please set LLM_TYPE="llama3",
 # if use openbmb/MiniCPM-o-2_6 or openbmb/MiniCPM-V-2_6, please set LLM_TYPE=qwen
 LLM_TYPE="qwen"   
-MODEL_MAX_Length=2048 # if conduct multi-images sft, please set MODEL_MAX_Length=4096
+MODEL_MAX_Length=256 # Reduced for testing (original: 2048, for multi-images: 4096)
 
 DISTRIBUTED_ARGS="
     --nproc_per_node $GPUS_PER_NODE \
@@ -31,39 +32,42 @@ DISTRIBUTED_ARGS="
 SNEI_ARGS=""
 if [ "$SNEI_FORMAT" = "true" ]; then SNEI_ARGS="--snei_format true"; fi
 
-torchrun $DISTRIBUTED_ARGS finetune.py  \
+EVAL_ARGS=""
+if [ -n "$EVAL_DATA" ]; then
+    EVAL_ARGS="--eval_data_path $EVAL_DATA --do_eval --evaluation_strategy steps --eval_steps 10"
+fi
+
+# Try without torchrun first (single process, less overhead)
+python finetune.py  \
     --model_name_or_path $MODEL \
     --llm_type $LLM_TYPE \
     --data_path $DATA \
-    --eval_data_path $EVAL_DATA \
+    $EVAL_ARGS \
     $SNEI_ARGS \
     --remove_unused_columns false \
     --label_names "labels" \
     --prediction_loss_only false \
     --bf16 false \
     --bf16_full_eval false \
-    --fp16 true \
-    --fp16_full_eval true \
+    --fp16 false \
+    --fp16_full_eval false \
     --do_train \
-    --do_eval \
-    --tune_vision true \
+    --tune_vision false \
     --tune_llm false \
     --use_lora true \
     --lora_target_modules "llm\..*layers\.\d+\.self_attn\.(q_proj|k_proj|v_proj|o_proj)" \
     --model_max_length $MODEL_MAX_Length \
-    --max_slice_nums 9 \
-    --max_steps 10000 \
-    --eval_steps 1000 \
+    --max_slice_nums 1 \
+    --max_steps 20 \
     --output_dir output/output__lora \
     --logging_dir output/output_lora \
     --logging_strategy "steps" \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 1 \
-    --evaluation_strategy "steps" \
     --save_strategy "steps" \
-    --save_steps 1000 \
-    --save_total_limit 10 \
+    --save_steps 10 \
+    --save_total_limit 2 \
     --learning_rate 1e-6 \
     --weight_decay 0.1 \
     --adam_beta2 0.95 \
@@ -71,5 +75,5 @@ torchrun $DISTRIBUTED_ARGS finetune.py  \
     --lr_scheduler_type "cosine" \
     --logging_steps 1 \
     --gradient_checkpointing true \
-    --deepspeed ds_config_zero2.json \
     --report_to "tensorboard" # wandb
+    # --deepspeed ds_config_zero2.json  # Disabled for testing (requires compilation)
