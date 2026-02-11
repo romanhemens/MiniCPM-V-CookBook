@@ -23,6 +23,43 @@ import transformers
 if not _have_flash_attn:
     import transformers.utils.import_utils as _tf_import_utils
     _tf_import_utils.is_flash_attn_2_available = lambda: False
+    
+    # Patch _is_package_available to return False for flash_attn BEFORE any imports happen
+    # This prevents the ValueError when importlib tries to check flash_attn.__spec__
+    try:
+        import importlib.util
+        _original_find_spec = importlib.util.find_spec
+        
+        def _patched_find_spec(name, package=None):
+            """Patched find_spec that returns None for flash_attn"""
+            if name == 'flash_attn':
+                return None
+            return _original_find_spec(name, package)
+        
+        importlib.util.find_spec = _patched_find_spec
+    except Exception:
+        pass
+    
+    # Also patch check_imports to skip flash_attn validation
+    try:
+        import transformers.dynamic_module_utils as _dm_utils
+        _original_check_imports = _dm_utils.check_imports
+        
+        def _patched_check_imports(resolved_module_file):
+            """Patched version that filters out flash_attn from required imports"""
+            try:
+                modules_needed = _original_check_imports(resolved_module_file)
+                if modules_needed and 'flash_attn' in modules_needed:
+                    # Remove flash_attn from the list - we'll use eager/sdpa instead
+                    modules_needed = [m for m in modules_needed if m != 'flash_attn']
+                return modules_needed
+            except Exception:
+                # If original check fails, return None to skip validation
+                return None
+        
+        _dm_utils.check_imports = _patched_check_imports
+    except Exception:
+        pass
 from accelerate.utils import DistributedType
 from deepspeed import zero
 from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
