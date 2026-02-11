@@ -53,11 +53,17 @@ dependencies = [
     "vector-quantize-pytorch==1.18.5",
     "vocos==0.1.0",
     "setuptools<70",
+    "ipykernel>=7.2.0",
+    "bitsandbytes>=0.42.0",
+    "mpi4py>=4.1.1",
 ]
 
 [project.optional-dependencies]
 # Only install on Linux with CUDA: uv sync --extra flash-attn
 flash-attn = ["flash-attn"]
+
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch"]
 
 [tool.uv]
 required-environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
